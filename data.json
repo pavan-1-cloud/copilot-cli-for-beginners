@@ -1,0 +1,26 @@
+[
+  {
+    "title": "Temp Timeout",
+    "author": "Author",
+    "year": 2000,
+    "read": false
+  },
+  {
+    "title": "CLI Title",
+    "author": "CLI Author",
+    "year": 1999,
+    "read": false
+  },
+  {
+    "title": "FindMe",
+    "author": "Find Author",
+    "year": 2005,
+    "read": false
+  },
+  {
+    "title": "Other",
+    "author": "Other Author",
+    "year": 2010,
+    "read": false
+  }
+]

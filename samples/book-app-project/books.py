@@ -17,7 +17,7 @@ import time
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, ContextManager, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -109,93 +109,90 @@ class BookCollection:
         self.books: List[Book] = []
         self.load_books()
 
-    def load_books(self) -> None:
-        """Load books from the JSON file.
-
-        Skips malformed entries but loads valid ones. Uses logging for diagnostics.
-        """
+    def _read_json_file(self):
         try:
             if not os.path.exists(self.data_file):
-                self.books = []
-                return
-
-            # Acquire a short lock to avoid reading during a write
+                return []
             try:
                 with _file_lock(self.data_file, timeout=0.5):
                     with open(self.data_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
+                        return json.load(f)
             except TimeoutError:
-                # If lock cannot be acquired quickly, try reading without it
                 with open(self.data_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-            if not isinstance(data, list):
-                logger.warning("%s does not contain a list. Starting with empty collection.", self.data_file)
-                self.books = []
-                return
-
-            books: List[Book] = []
-            current_year = datetime.utcnow().year
-            for i, entry in enumerate(data):
-                try:
-                    if not isinstance(entry, dict):
-                        raise ValueError("entry is not a JSON object")
-
-                    title = entry.get("title")
-                    author = entry.get("author")
-
-                    if not title or not author:
-                        logger.warning("Skipping invalid book entry at index %d (missing title/author).", i)
-                        continue
-
-                    if "year" not in entry:
-                        logger.warning("Skipping book '%s' at index %d: missing 'year'.", title, i)
-                        continue
-
-                    try:
-                        year = int(entry.get("year"))
-                    except (TypeError, ValueError):
-                        logger.warning("Skipping book '%s' at index %d: invalid 'year'.", title, i)
-                        continue
-
-                    if year < 0 or year > current_year:
-                        logger.warning("Skipping book '%s' at index %d: year %s out of range.", title, i, year)
-                        continue
-
-                    read = _parse_bool(entry.get("read", False))
-
-                    books.append(Book(title=title, author=author, year=year, read=read))
-                except (TypeError, ValueError) as e:
-                    logger.warning("Skipping malformed book entry at index %d: %s", i, e)
-
-            self.books = books
-
+                    return json.load(f)
         except json.JSONDecodeError:
+            return None
+        except OSError:
+            return None
+
+    def _parse_entry(self, entry, i, current_year):
+        if not isinstance(entry, dict):
+            logger.warning("Skipping malformed book entry at index %d: entry is not a JSON object", i)
+            return None
+
+        title = entry.get("title")
+        author = entry.get("author")
+
+        if not title or not author:
+            logger.warning("Skipping invalid book entry at index %d (missing title/author).", i)
+            return None
+
+        if "year" not in entry:
+            logger.warning("Skipping book '%s' at index %d: missing 'year'.", title, i)
+            return None
+
+        try:
+            year = int(entry.get("year"))
+        except (TypeError, ValueError):
+            logger.warning("Skipping book '%s' at index %d: invalid 'year'.", title, i)
+            return None
+
+        if year < 0 or year > current_year:
+            logger.warning("Skipping book '%s' at index %d: year %s out of range.", title, i, year)
+            return None
+
+        read = _parse_bool(entry.get("read", False))
+        return Book(title=title, author=author, year=year, read=read)
+
+    def load_books(self) -> None:
+        """Load books from the JSON file using small helpers for readability."""
+        data = self._read_json_file()
+        if data is None:
             logger.warning("%s is corrupted or contains invalid JSON. Starting with empty collection.", self.data_file)
             self.books = []
-        except OSError as e:
-            logger.error("Error reading %s: %s. Starting with empty collection.", self.data_file, e)
+            return
+
+        if not isinstance(data, list):
+            logger.warning("%s does not contain a list. Starting with empty collection.", self.data_file)
             self.books = []
+            return
 
-    def save_books(self) -> None:
-        """Atomically save the current book collection to JSON.
+        books: List[Book] = []
+        current_year = datetime.now(timezone.utc).year
+        for i, entry in enumerate(data):
+            try:
+                book = self._parse_entry(entry, i, current_year)
+                if book:
+                    books.append(book)
+            except (TypeError, ValueError) as e:
+                logger.warning("Skipping malformed book entry at index %d: %s", i, e)
 
-        Writes to a temporary file in the same directory and then replaces the
-        target file. Uses a simple advisory lock to reduce concurrent writers.
-        """
+        self.books = books
+
+    def _atomic_write_json(self, data) -> bool:
         try:
             dirpath = os.path.dirname(os.path.abspath(self.data_file)) or "."
-            # Ensure directory exists
             os.makedirs(dirpath, exist_ok=True)
 
             with _file_lock(self.data_file):
                 fd, tmp_path = tempfile.mkstemp(prefix="tmp-", dir=dirpath, text=True)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump([asdict(b) for b in self.books], f, indent=2)
+                        json.dump(data, f, indent=2)
                         f.flush()
                         os.fsync(f.fileno())
                     os.replace(tmp_path, self.data_file)
+                    return True
                 finally:
                     if os.path.exists(tmp_path):
                         try:
@@ -206,6 +203,11 @@ class BookCollection:
             logger.error("Could not acquire lock to save books: %s", e)
         except OSError as e:
             logger.error("Error saving books to %s: %s", self.data_file, e)
+        return False
+
+    def save_books(self) -> None:
+        """Persist the current book collection to disk using an atomic writer."""
+        self._atomic_write_json([asdict(b) for b in self.books])
 
     def add_book(self, title: str, author: str, year: int) -> Book:
         """Add a new book to the collection and persist it.
@@ -284,11 +286,24 @@ class BookCollection:
         return False
 
     def find_by_author(self, author: str) -> List[Book]:
-        """Return books that match the author using case-insensitive substring matching."""
-        if not author:
+        """Return books that match the author using case-insensitive substring matching.
+
+        Uses a simple lowercased substring check. Empty or non-string input returns
+        an empty list to avoid returning all books for whitespace-only queries.
+        """
+        if not isinstance(author, str):
             return []
-        a = author.strip().lower()
-        return [b for b in self.books if isinstance(b.author, str) and a in b.author.strip().lower()]
+        query = author.strip().lower()
+        if not query:
+            return []
+
+        results: List[Book] = []
+        for b in self.books:
+            if not isinstance(b.author, str):
+                continue
+            if query in b.author.strip().lower():
+                results.append(b)
+        return results
 
     def search(self, query: str) -> List[Book]:
         """Search books by title or author using case-insensitive substring matching."""
