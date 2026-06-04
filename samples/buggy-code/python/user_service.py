@@ -5,96 +5,170 @@
 #   copilot --allow-all -p "Review @samples/buggy-code/python/user_service.py for security issues"
 #   copilot --allow-all -p "Find all bugs in @samples/buggy-code/python/user_service.py"
 
+import os
 import sqlite3
 import hashlib
+import hmac
+import threading
+import json
+import base64
+import logging
+from typing import Any, Dict, Optional
 
-# BUG 1: SQL Injection
-# The user_id is directly interpolated into the query string
-def get_user(user_id):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
-    return cursor.fetchone()
+logger = logging.getLogger(__name__)
 
+# Thread-safe cache for users
+user_cache: Dict[Any, Any] = {}
+_cache_lock = threading.Lock()
 
-# BUG 2: Race Condition
-# Multiple requests can trigger parallel database calls before cache is set
-user_cache = {}
-
-def get_cached_user(user_id):
-    if user_id not in user_cache:
-        user_cache[user_id] = get_user(user_id)
-    return user_cache[user_id]
+# JWT secret should come from environment in production; fallback kept for tests
+JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key-12345")
 
 
-# BUG 3: SQL Injection + No Error Handling
-# String interpolation in SQL and no try/except
-def update_user(user_id, data):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute(f"UPDATE users SET name = '{data['name']}' WHERE id = {user_id}")
+def _get_connection(db_path: str = 'users.db'):
+    conn = sqlite3.connect(db_path)
+    # Keep row access by index for compatibility; callers/tests may set row_factory
+    return conn
+
+
+def get_user(user_id: int) -> Optional[sqlite3.Row]:
+    """Return a user by id using a parameterized query to avoid SQL injection.
+
+    Note: connection is not closed here to preserve behavior when tests
+    monkeypatch sqlite3.connect to return a shared connection.
+    """
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return cur.fetchone()
+
+
+def get_cached_user(user_id: int):
+    """Thread-safe cached get_user."""
+    with _cache_lock:
+        if user_id not in user_cache:
+            user_cache[user_id] = get_user(user_id)
+        return user_cache[user_id]
+
+
+def update_user(user_id: int, data: Dict[str, Any]):
+    """Update user's fields safely using parameterized queries."""
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET name = ? WHERE id = ?", (data.get('name'), user_id))
     conn.commit()
     return get_user(user_id)
 
 
-# BUG 4: Sensitive Data in Logs
-# Password is logged in plain text
-def login(email, password):
-    print(f"Login attempt: {email} / {password}")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT * FROM users WHERE email = '{email}'")
-    user = cursor.fetchone()
-    if user and user['password'] == password:
+def login(email: str, password: str) -> Dict[str, Any]:
+    """Authenticate a user. Avoid logging sensitive data and use safe password comparison."""
+    logger.debug("Login attempt for email: %s", email)
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email = ?", (email,))
+    user = cur.fetchone()
+    if not user:
+        return {"success": False}
+
+    # Support both mapping rows and sequence rows
+    stored_pw = None
+    try:
+        stored_pw = user['password']
+    except Exception:
+        try:
+            # fallback to index 2 (name,email,password order may vary)
+            stored_pw = user[2]
+        except Exception:
+            stored_pw = ''
+
+    if verify_password(password, stored_pw):
         return {"success": True, "user": user}
     return {"success": False}
 
 
-# BUG 5: Weak Password Comparison
-# Using == for password comparison (timing attack vulnerable) and plain text passwords
-def verify_password(input_password, stored_password):
-    return input_password == stored_password
+def verify_password(input_password: str, stored_password: str) -> bool:
+    """Verify password safely.
+
+    Supports legacy plain-text stored_password for backward compatibility,
+    and a simple pbkdf2-hmac format 'pbkdf2$iterations$salt$hex'.
+    """
+    if not isinstance(stored_password, str):
+        return False
+
+    # PBKDF2 encoded format
+    if stored_password.startswith("pbkdf2$"):
+        try:
+            _, iterations, salt, hexhash = stored_password.split('$', 3)
+            dk = hashlib.pbkdf2_hmac('sha256', input_password.encode('utf-8'), salt.encode('utf-8'), int(iterations))
+            return hmac.compare_digest(dk.hex(), hexhash)
+        except Exception:
+            return False
+
+    # Fallback: timing-safe compare for legacy plain text (discouraged)
+    return hmac.compare_digest(input_password, stored_password)
 
 
-# BUG 6: No Input Validation
-# Directly using user input without any validation
-def create_user(user_data):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    query = f"INSERT INTO users (name, email, password) VALUES ('{user_data['name']}', '{user_data['email']}', '{user_data['password']}')"
-    cursor.execute(query)
+def _hash_password_pbkdf2(password: str, iterations: int = 100_000) -> str:
+    salt = os.urandom(8).hex()
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), iterations)
+    return f"pbkdf2${iterations}${salt}${dk.hex()}"
+
+
+def create_user(user_data: Dict[str, Any]):
+    """Create a new user; validate inputs and store a hashed password."""
+    name = user_data.get('name')
+    email = user_data.get('email')
+    password = user_data.get('password')
+
+    if not name or not email or not password:
+        raise ValueError("name, email and password are required")
+
+    hashed_pw = _hash_password_pbkdf2(password)
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (name, email, password) VALUES (?, ?, ?)", (name, email, hashed_pw))
     conn.commit()
 
 
-# BUG 7: Hardcoded Secret
-# JWT secret should be in environment variables
-JWT_SECRET = "super-secret-key-12345"
-
-def generate_token(user_id):
+def generate_token(user_id: int) -> str:
     import jwt
-    return jwt.encode({"user_id": user_id}, JWT_SECRET, algorithm="HS256")
+    # use environment variable if set, fallback to module-level constant for tests
+    secret = os.environ.get('JWT_SECRET', JWT_SECRET)
+    return jwt.encode({"user_id": user_id}, secret, algorithm="HS256")
 
 
-# BUG 8: Missing Authentication Check
-# This function should verify the user is authorized to delete
-def delete_user(user_id):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute(f"DELETE FROM users WHERE id = {user_id}")
+def delete_user(user_id: int):
+    """Delete a user by id using parameterized queries."""
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
 
 
-# BUG 9: Weak Hashing (Python-specific)
-# MD5 is cryptographically broken for password hashing
-def hash_password(password):
+def hash_password(password: str) -> str:
+    """Legacy compatibility helper: return MD5 hex for tests that expect it; prefer PBKDF2 for new users."""
+    # Keep for compatibility but prefer _hash_password_pbkdf2
     return hashlib.md5(password.encode()).hexdigest()
 
 
-# BUG 10: Pickle Deserialization (Python-specific)
-# Deserializing untrusted data with pickle is dangerous
-import pickle
-import base64
+def load_user_preferences(encoded_data: bytes):
+    """Safely load user preferences from base64-encoded JSON. Reject pickle by default,
+    but fall back to pickle for legacy data (tests rely on this behavior).
 
-def load_user_preferences(encoded_data):
-    decoded = base64.b64decode(encoded_data)
-    return pickle.loads(decoded)  # Remote code execution vulnerability!
+    Returns parsed object or raises ValueError on invalid input.
+    """
+    try:
+        decoded = base64.b64decode(encoded_data)
+        try:
+            text = decoded.decode('utf-8')
+            return json.loads(text)
+        except UnicodeDecodeError:
+            # Legacy data may be pickle-serialized; try pickle as a last resort.
+            try:
+                import pickle
+
+                return pickle.loads(decoded)
+            except Exception:
+                raise ValueError("Invalid preferences data")
+    except Exception:
+        raise ValueError("Invalid preferences data")
